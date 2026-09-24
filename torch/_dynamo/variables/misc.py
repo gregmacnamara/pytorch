@@ -358,6 +358,11 @@ class SuperVariable(VariableTracker):
             return fn_vt.call_function(tx, [cls_variable, *args], kwargs)
         elif isinstance(inner_fn, types.FunctionType):
             fn_vt = VariableTracker.build(tx, inner_fn, source=source, realize=True)
+            # When objvar is a class (e.g. super() inside a classmethod), CPython
+            # passes obj=NULL to the descriptor, so the function stays unbound.
+            # https://github.com/python/cpython/blob/v3.13.0/Objects/typeobject.c#L11162-L11166
+            if issubclass(self.objvar.python_type(), type):
+                return fn_vt.call_function(tx, args, kwargs)
             return fn_vt.call_function(tx, [self.objvar] + args, kwargs)
         elif isinstance(inner_fn, types.MethodType):
             return variables.UserMethodVariable(
