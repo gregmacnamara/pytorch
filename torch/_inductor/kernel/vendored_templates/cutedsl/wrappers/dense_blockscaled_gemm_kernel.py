@@ -29,6 +29,7 @@ from cutlass.operators.utils.common import tuple_to_string
 from cutlass.operators.utils.device import to_cuda_stream
 from cutlass.operators.utils.tensor import strides_to_layout_string
 
+from torch._inductor import config
 from torch._inductor.codegen.nv_universal_gemm.epilogue_capabilities import (
     BLOCK_SCALED_GEMM_REDUCTION_CAPABILITIES,
 )
@@ -48,6 +49,7 @@ _ONES_ALPHA: dict = {}
 @dataclasses.dataclass(kw_only=True)
 class InductorSm100DesignMetadata(Sm100DesignMetadata):
     use_prefetch: bool = False
+    use_pdl: bool = False
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -222,14 +224,40 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
             metadata.design.cluster_shape[0],
             metadata.design.cluster_shape[1],
         )
-        self.impl = BlockScaledGemmKernelImpl(  # pyrefly: ignore[not-callable]
-            self.sf_vec_size,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            use_prefetch=getattr(metadata.design, "use_prefetch", False),
-        )
+        self.use_prefetch = getattr(metadata.design, "use_prefetch", False)
+        self.use_pdl = getattr(metadata.design, "use_pdl", False)
         self.cluster_shape_mn = cluster_shape_mn
         self.mma_tiler_mn = mma_tiler_mn
+        self.impl = self._make_impl()
+
+    def _make_impl(self, *, late_pdl_wait: bool = False):
+        return BlockScaledGemmKernelImpl(  # pyrefly: ignore[not-callable]
+            self.sf_vec_size,
+            self.mma_tiler_mn,
+            self.cluster_shape_mn,
+            use_prefetch=self.use_prefetch,
+            use_pdl=self.use_pdl,
+            late_pdl_wait=late_pdl_wait,
+        )
+
+    def _use_late_pdl_wait(self, args: GemmArguments) -> bool:
+        # Descriptor/layout setup is a material fraction of small NVFP4 decode
+        # kernels. Keep the previously validated M<=32, K<=4096 scope, and use
+        # the same placement for the next decode bucket when K<=5120. The
+        # latter matches FlashInfer's prologue ordering and avoids giving up
+        # useful setup overlap on common batch-64 attention/MLP projections.
+        logical_m = getattr(args, "logical_m", None)
+        if logical_m is None:
+            logical_m = args.out.shape[-2]
+        logical_k = args.A.shape[-1]
+        return (
+            self.use_pdl
+            and self.sf_vec_size == 16
+            and (
+                (logical_m <= 32 and logical_k <= 4096)
+                or (32 < logical_m <= 64 and logical_k <= 5120)
+            )
+        )
 
     @staticmethod
     def _major_modes(args):
@@ -263,6 +291,9 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         max_active_clusters = cutedsl_utils.mma.get_max_active_clusters(
             self.cluster_shape_mn
         )
+        # Operators are shared across compiled shapes, so keep this shape policy
+        # on a fresh implementation instead of mutating the cached instance.
+        impl = self._make_impl(late_pdl_wait=self._use_late_pdl_wait(args))
 
         # Fused global scale: alpha is ALWAYS threaded as a trailing kernel arg
         # (ones when not fusing) so the kernel signature is consistent across all
@@ -295,7 +326,7 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                 reduction_args, cute
             )
             return self.cute_compile(
-                self.impl,
+                impl,
                 args.A.tensor,
                 args.B.tensor,
                 args.A.scale.tensor,
@@ -319,7 +350,7 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                 target_sm=target_sm,
             )
         return self.cute_compile(
-            self.impl,
+            impl,
             args.A.tensor,
             args.B.tensor,
             args.A.scale.tensor,
@@ -737,11 +768,10 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         use_pdl: bool,
     ) -> list[VendoredDenseBlockScaledGemmKernel]:
         """Generate operators without consulting mutable process-wide config."""
-        if use_pdl:
-            return []
         return cls._generate_operators(
             metadata_filter,
             prefetch_mode=prefetch_mode,
+            use_pdl=use_pdl,
         )
 
     @classmethod
@@ -753,6 +783,7 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         args=None,
         *,
         prefetch_mode: str | None = None,
+        use_pdl: bool | None = None,
     ) -> list[VendoredDenseBlockScaledGemmKernel]:
         if target_sm is not None and target_sm.cc not in [100, 101, 103]:
             return []
@@ -761,12 +792,13 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
 
         if prefetch_mode is None:
             prefetch_mode = "0"
+        if use_pdl is None:
+            use_pdl = config.nvgemm_pdl == "1"
         prefetch_options = {
             "0": [False],
             "1": [True],
             "autotune": [False, True],
         }.get(prefetch_mode, [False])
-
         design_params: dict[str, list[Any]] = {
             "mma_instruction_type": [BlackwellTcgen05Mma],
             "use_2cta_mma": [True],
@@ -775,6 +807,7 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
             "cluster_shape": [(M, N, 1) for M in [1, 2, 4] for N in [1, 2, 4]],
             "use_tma_store": [True],
             "use_prefetch": prefetch_options,
+            "use_pdl": [use_pdl],
         }
 
         param_names = list(design_params.keys())
@@ -785,13 +818,12 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         for operands in cls._metadata_operand_combinations():
             for values in itertools.product(*param_values):
                 design = InductorSm100DesignMetadata(**dict(zip(param_names, values)))
-
                 operator_name = (
                     f"inductor_vendored.{cls.__name__}_sm100_"
                     "{layout}_A{A}_B{B}_out{out}_SFA{SFA}_SFB{SFB}_"
                     "acc{acc}_scale{scale_mode}_swizzle{scale_swizzle}_"
                     "{num_cta}cta_cluster{cluster}_tile{tile}"
-                    "{_tma_store}{_prefetch}"
+                    "{_tma_store}{_prefetch}{_pdl}"
                 ).format(
                     layout=strides_to_layout_string(
                         operands.A.stride,
@@ -811,6 +843,7 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
                     tile=tuple_to_string(design.tile_shape),
                     _tma_store="_tma_store" if design.use_tma_store else "",
                     _prefetch="_prefetch" if design.use_prefetch else "",
+                    _pdl="_pdl" if design.use_pdl else "",
                 )
 
                 metadata = OperatorMetadata(

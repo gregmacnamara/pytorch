@@ -52,6 +52,9 @@ log = getArtifactLogger(__name__, "output_code")
 
 _NVFP4_MAX_PROFILING_CONFIGS = 3
 _NVFP4_AUTOTUNE_CUDAGRAPH_UNROLL = 16
+_NVFP4_PDL_MAX_M = 256
+_NVFP4_PDL_MIN_WIDTH = 1024
+_NVFP4_PDL_MAX_WIDTH = 65536
 
 
 class GemmVariant(Enum):
@@ -123,6 +126,25 @@ def _use_swap_ab_for_scaled_gemm(
             scale_type_a,
             scale_type_b,
         )
+    )
+
+
+def _use_nvfp4_pdl(logical_m: int, logical_n: int, logical_k: int) -> bool:
+    if config.nvgemm_pdl == "1":
+        return True
+    if config.nvgemm_pdl != "auto":
+        return False
+    # Keep the automatic policy within the measured transformer decode
+    # envelope. End-to-end hybrid-model measurements at M=48 and M=64 regress
+    # with PDL when the smaller contracted/output width is intermediate-sized,
+    # even though the same kernels can be faster in isolation.
+    width_min = min(logical_n, logical_k)
+    width_max = max(logical_n, logical_k)
+    return (
+        0 < logical_m <= _NVFP4_PDL_MAX_M
+        and _NVFP4_PDL_MIN_WIDTH <= width_min
+        and width_max <= _NVFP4_PDL_MAX_WIDTH
+        and not (32 < logical_m <= 64 and 2048 < width_min < 4096)
     )
 
 
@@ -289,6 +311,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         from torch._inductor.utils import _ensure_fp4_dtype_registered
 
         _ensure_fp4_dtype_registered()
+        logical_m = out.shape[-2]
 
         if self.has_bias_epilogue:
             # Benchmark the real fused kernel (GEMM + bias-add epilogue). The
@@ -311,7 +334,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
                 input_tensors = (b.t(), a.t()) + input_tensors[2:]
             out = out.t()
 
-        helper_kwargs: dict[str, Any] = {}
+        helper_kwargs: dict[str, Any] = {"logical_m": logical_m}
         if self.variant == GemmVariant.SCALED_GEMM:
             scale_mode_a, swizzle_mode_a, scale_mode_b, swizzle_mode_b = (
                 _get_scaled_gemm_modes(
@@ -321,14 +344,16 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
                     self.swizzle_type_b,
                 )
             )
-            helper_kwargs = {
-                "scale_mode_a": scale_mode_a,
-                "swizzle_mode_a": swizzle_mode_a,
-                "scale_mode_b": scale_mode_b,
-                "swizzle_mode_b": swizzle_mode_b,
-            }
+            helper_kwargs.update(
+                {
+                    "scale_mode_a": scale_mode_a,
+                    "swizzle_mode_a": swizzle_mode_a,
+                    "scale_mode_b": scale_mode_b,
+                    "swizzle_mode_b": swizzle_mode_b,
+                }
+            )
 
-        cache_key = _create_gemm_cache_key(input_tensors, out)
+        cache_key = _create_gemm_cache_key(input_tensors, out, logical_m=logical_m)
         dev_idx = input_tensors[0].device.index or 0
         kernel_name = self.kernel.metadata.operator_name
         disk_config_key = _make_disk_config_key(
@@ -426,6 +451,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
             has_epilogue=True,
             aux_tensors=(bias,),
             epilogue_source=_NVGEMM_BIAS_ADD_EPILOGUE_FINGERPRINT,
+            logical_m=out.shape[-2],
         )
         dev_idx = gemm_tensors[0].device.index or 0
         disk_config_key = _make_disk_config_key(
@@ -459,6 +485,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
             out,
             self.accumulator_type,
             kernel_name=kernel_name,
+            args_kwargs={"logical_m": out.shape[-2]},
             epilogue_args=epilogue_args,
             epilogue_source=_NVGEMM_BIAS_ADD_EPILOGUE_FINGERPRINT,
             fallback_fn=disk_fallback,
@@ -918,7 +945,7 @@ def _add_nv_gemm_choices_impl(
         log.debug("Failed to create dummy tensors for %s", variant.op_name)
         return
 
-    helper_kwargs: dict[str, Any] = {}
+    helper_kwargs: dict[str, Any] = {"logical_m": layout.size[-2]}
     if variant == GemmVariant.SCALED_GEMM:
         try:
             scale_mode_a, swizzle_mode_a, scale_mode_b, swizzle_mode_b = (
@@ -931,12 +958,14 @@ def _add_nv_gemm_choices_impl(
             )
         except NotImplementedError:
             return
-        helper_kwargs = {
-            "scale_mode_a": scale_mode_a,
-            "swizzle_mode_a": swizzle_mode_a,
-            "scale_mode_b": scale_mode_b,
-            "swizzle_mode_b": swizzle_mode_b,
-        }
+        helper_kwargs.update(
+            {
+                "scale_mode_a": scale_mode_a,
+                "swizzle_mode_a": swizzle_mode_a,
+                "scale_mode_b": scale_mode_b,
+                "swizzle_mode_b": swizzle_mode_b,
+            }
+        )
 
     args = _create_gemm_arguments(
         variant.name,
@@ -977,6 +1006,9 @@ def _add_nv_gemm_choices_impl(
     else:
         candidate_source = "manifest"
     is_nvfp4 = False
+    # PDL is enabled only through the measured NVFP4 shape policy below. Do
+    # not let the global generation default leak into other scaled formats.
+    scaled_use_pdl = False
     if mm_inputs is not None:
         input_dtype_a = mm_inputs.dtype(mm_inputs._mat1_idx)
         input_dtype_b = mm_inputs.dtype(mm_inputs._mat2_idx)
@@ -987,6 +1019,13 @@ def _add_nv_gemm_choices_impl(
             scale_type_a,
             scale_type_b,
         )
+        problem_m, problem_n, problem_k = mm_inputs.mnk_hinted()
+        logical_m = problem_n if swap_ab else problem_m
+        logical_n = problem_m if swap_ab else problem_n
+        if is_nvfp4:
+            # NVFP4 operands store two logical K values per byte.
+            scaled_use_pdl = _use_nvfp4_pdl(logical_m, logical_n, 2 * problem_k)
+
     non_efc_kernels, efc_kernels = partition_compatible_kernels(
         args,
         cc_int,
@@ -995,6 +1034,7 @@ def _add_nv_gemm_choices_impl(
         efc_only=bias_node is not None,
         candidate_source=candidate_source,
         classifier_key="nvgemm_efc_partition_v1",
+        scaled_use_pdl=scaled_use_pdl,
     )
     if not config.epilogue_fusion:
         efc_kernels = []
@@ -1374,7 +1414,7 @@ def add_nv_universal_scaled_gemm_choices(
     # Kernel output shape is (N, M) — the transpose of the original (M, N)
     swap_kernel_layout = _transposed_kernel_layout(layout)
 
-    # Rank against the transposed (N, M, K) problem. Using the original
+    # Rank against the transposed (N, M, K) problem.  Using the original
     # MMKernelInputs here hides the narrow-N tactics that make this transform
     # useful for decode-sized M.
     swap_inputs = MMKernelInputs(
